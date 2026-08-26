@@ -2,7 +2,10 @@
 // All configurable values with safe defaults. No secrets stored here.
 
 export const config = {
-  // yt-dlp binary path (empty = use system PATH)
+  // Remote backend URL (set in production when frontend is on Vercel)
+  backendUrl: process.env.BACKEND_URL || "",
+
+  // yt-dlp binary path (empty = use system PATH, only for local dev)
   ytDlpPath: process.env.YT_DLP_PATH || "",
 
   // Timeouts (ms)

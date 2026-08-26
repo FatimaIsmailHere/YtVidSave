@@ -1,25 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { config } from "@/lib/config";
-import { checkRateLimit, getClientIp } from "@/lib/rateLimit";
 import { validateUrl, ERRORS } from "@/lib/downloader/validation";
 import { detectPlatform } from "@/lib/downloader/platforms";
-import { getVideoInfo, classifyYtDlpError } from "@/lib/downloader/ytDlp";
 
 export async function POST(request: NextRequest) {
   const startTime = Date.now();
 
   try {
-    // ── Rate Limit ──────────────────────────────────────────────────────
-    const ip = getClientIp(request);
-    const rl = checkRateLimit(`analyze:${ip}`, config.rateLimitAnalyze);
-    if (!rl.allowed) {
-      const err = ERRORS.rateLimited(rl.retryAfterMs);
-      return NextResponse.json(err, {
-        status: 429,
-        headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) },
-      });
-    }
-
     // ── Parse Body ──────────────────────────────────────────────────────
     let body: { url?: string };
     try {
@@ -33,7 +20,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(ERRORS.invalidUrl(), { status: 400 });
     }
 
-    // ── Validate URL ────────────────────────────────────────────────────
+    // ── Validate URL locally ────────────────────────────────────────────
     const validation = validateUrl(url);
     if (!validation.valid) {
       return NextResponse.json(
@@ -42,31 +29,45 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // ── Detect Platform ─────────────────────────────────────────────────
     const platform = detectPlatform(validation.normalized!);
     if (!platform) {
       return NextResponse.json(ERRORS.unsupportedPlatform(), { status: 400 });
     }
 
-    // ── Fetch Media Info via yt-dlp ─────────────────────────────────────
+    // ── Proxy to remote backend OR use local yt-dlp ─────────────────────
+    if (config.backendUrl) {
+      // REMOTE BACKEND: forward the request
+      const backendRes = await fetch(`${config.backendUrl}/api/analyze`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: validation.normalized }),
+        signal: AbortSignal.timeout(config.analyzeTimeout),
+      });
+
+      const data = await backendRes.json();
+      const duration = Date.now() - startTime;
+      console.log(`[analyze:proxy] status=${backendRes.status} duration=${duration}ms`);
+
+      return NextResponse.json(data, { status: backendRes.status });
+    }
+
+    // LOCAL BACKEND: use local yt-dlp (for local development)
+    const { getVideoInfo, classifyYtDlpError } = await import("@/lib/downloader/ytDlp");
+
     let mediaInfo;
     try {
       mediaInfo = await getVideoInfo(validation.normalized!);
     } catch (err: unknown) {
-      // DEV-ONLY: Full error details in terminal for diagnosis
       const elapsed = Date.now() - startTime;
       if (process.env.NODE_ENV !== "production") {
-        console.error(`[analyze] FAILED for ${platform.id} after ${elapsed}ms:`);
-        if (err instanceof Error) console.error(`  message: ${err.message}`);
+        console.error(`[analyze] FAILED for ${platform.id} after ${elapsed}ms:`, err);
       }
 
-      // Timeout
       const msg = err instanceof Error ? err.message : "";
       if (msg.includes("timed out") || msg.includes("timeout")) {
         return NextResponse.json(ERRORS.processingTimeout(), { status: 504 });
       }
 
-      // Classify the yt-dlp error into a user-friendly message
       const classified = classifyYtDlpError(err);
       return NextResponse.json(
         { code: classified.category === "auth_required" ? "content_unavailable" : "content_unavailable",
@@ -76,7 +77,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // ── Build Response ──────────────────────────────────────────────────
     const result = {
       id: Math.random().toString(36).substring(2, 10),
       title: mediaInfo.title,
